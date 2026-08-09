@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: caerus-framework/caerus-framework/.github/workflows/go-module-ci.yml@main
+    with:
+      module: caerus-framework-valkey-state
+      deps: "caerus-framework caerus-framework-logs caerus-framework-configuration caerus-framework-observability caerus-framework-valkey"
+      valkey: true
+      caerusvet: true
