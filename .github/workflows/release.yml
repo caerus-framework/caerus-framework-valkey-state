@@ -1,0 +1,23 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: SemVer tag to release (e.g. v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: caerus-framework/caerus-framework/.github/workflows/go-module-release.yml@main
+    with:
+      module: caerus-framework-valkey-state
+      deps: "caerus-framework caerus-framework-logs caerus-framework-configuration caerus-framework-observability caerus-framework-valkey"
+      version: ${{ github.event_name == 'workflow_dispatch' && inputs.version || '' }}
+      valkey: true
