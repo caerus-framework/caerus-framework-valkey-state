@@ -92,7 +92,7 @@ func TestGetDependencies(t *testing.T) {
 		t.Fatalf("GetDependencies() with named peer = %v, want [cache logs]", deps)
 	}
 
-	withSrc := New(WithConfigSource("state", "config/state.json"))
+	withSrc := New(WithConfigSource("valkey-state", "config/valkey-state.json"))
 	deps = withSrc.GetDependencies()
 	if len(deps) != 3 {
 		t.Fatalf("GetDependencies() with source = %v, want [valkey logs configuration]", deps)
@@ -186,9 +186,15 @@ func TestKeyHelpers(t *testing.T) {
 }
 
 func TestNewSourceEnvPrefix(t *testing.T) {
-	s := New(WithConfigSource("valkey-state", "config/state.json"))
+	s := New(WithConfigSource("valkey-state", "config/valkey-state.json"))
 	if s.srcEnvPrefix != "VALKEY_STATE_" {
 		t.Fatalf("srcEnvPrefix = %q, want VALKEY_STATE_", s.srcEnvPrefix)
+	}
+	// Short source nicknames remain valid; EnvPrefix follows the source name
+	// unless WithSourceEnvPrefix overrides it.
+	short := New(WithConfigSource("state", "config/state.json"))
+	if short.srcEnvPrefix != "STATE_" {
+		t.Fatalf("short source srcEnvPrefix = %q, want STATE_", short.srcEnvPrefix)
 	}
 	s2 := New(WithConfigSource("state", "", WithSourceEnvPrefix("")))
 	if s2.srcEnvPrefix != "" {
