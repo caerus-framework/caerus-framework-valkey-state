@@ -130,7 +130,7 @@ func WithConfig(cfg StateConfig) Option {
 // named instances reload correctly). main only points the instance at where
 // the config lives.
 //
-//	cf_valkey_state.New(cf_valkey_state.WithConfigSource("state", "config/state.json"))
+//	cf_valkey_state.New(cf_valkey_state.WithConfigSource("valkey-state", "config/valkey-state.json"))
 //	cf_valkey_state.New(cf_valkey_state.WithConfigSource("sess", "/etc/app/sess.yaml",
 //	    cf_valkey_state.WithSourceFormat(cf_configuration.FormatYAML)))
 //

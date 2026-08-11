@@ -38,7 +38,7 @@ fw := cf.New(&cf.FrameworkOptions{
 	Components: []cf.CaerusComponent{
 		cf_postgres.New(cf_postgres.WithConfigSource("postgresql", "config/postgresql.json")),
 		cf_valkey.New(cf_valkey.WithConfigSource("valkey", "config/valkey.json")),
-		cf_valkey_state.New(cf_valkey_state.WithConfigSource("state", "config/state.json")),
+		cf_valkey_state.New(cf_valkey_state.WithConfigSource("valkey-state", "config/valkey-state.json")),
 		app.New(app.Options{}),
 	},
 })
@@ -85,7 +85,7 @@ fw := cf.New()
 
 logs := cf_logs.New(cf_logs.WithWriter(os.Stdout))
 valkey := cf_valkey.New(cf_valkey.WithConfigSource("valkey", "config/valkey.json"))
-state := cf_valkey_state.New(cf_valkey_state.WithConfigSource("state", "config/state.json"))
+state := cf_valkey_state.New(cf_valkey_state.WithConfigSource("valkey-state", "config/valkey-state.json"))
 fw.AddComponent(logs)
 fw.AddComponent(valkey) // GetDependencies() -> [logs configuration]
 fw.AddComponent(state)  // GetDependencies() -> [valkey logs configuration]
@@ -94,8 +94,11 @@ fw.AddComponent(state)  // GetDependencies() -> [valkey logs configuration]
 In both shapes the component is `cf.ConfigSourceRegistrar`-self-sufficient:
 `WithConfigSource` registers the `Source[StateConfig]` with the configuration
 component during argv absorption, so `main` never touches
-`os.Getenv`/`ParseFlags`. The `--state` path flag and per-field flags come from
-the source declaration.
+`os.Getenv`/`ParseFlags`. Prefer the **same string** for the config source
+name and the component `Name()` (`"valkey-state"`) so `GetDependencies` and
+`--valkey-state` / `VALKEY_STATE_` line up. You may still choose a shorter
+source name (e.g. `"state"`) — then remember `GetDependencies` must use
+`ComponentName` (`"valkey-state"`), not the source nickname.
 
 ## Usage
 
@@ -152,9 +155,10 @@ fail-open/fail-closed policy belongs to the app.
 
 ## Configuration
 
-Load `StateConfig` through the configuration component. The default `EnvPrefix`
-is `STATE_` (from the source name); `env` tags map `STATE_SESSION_TTL_SEC`,
-`STATE_CACHE_TTL_SEC`.
+Load `StateConfig` through the configuration component. With the recommended
+source name `"valkey-state"`, the default `EnvPrefix` is `VALKEY_STATE_`;
+`env` tags map `VALKEY_STATE_SESSION_TTL_SEC`, `VALKEY_STATE_CACHE_TTL_SEC`
+(override with `WithSourceEnvPrefix` if you want a shorter prefix).
 
 ```json
 {
