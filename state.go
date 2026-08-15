@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -68,24 +67,48 @@ type StateConfig struct {
 	// CacheTTLSec is the default cache TTL in seconds when a call leaves ttl
 	// at zero (default 5m).
 	CacheTTLSec int64 `json:"cache_ttl_sec,omitempty" yaml:"cache_ttl_sec,omitempty" env:"CACHE_TTL_SEC"`
+	// RateLimit is the nested counter-store section (Lua vs sticky-note map).
+	// HTTP limit/window numbers do not live here.
+	RateLimit RateLimitConfig `json:"rate_limit,omitempty" yaml:"rate_limit,omitempty" env:"-"`
+
+	// Env overlay cannot recurse into nested structs; these aliases merge
+	// into RateLimit in applyConfig (VALKEY_STATE_RATE_LIMIT_*).
+	RateLimitUseMemoryFallback *bool  `json:"-" yaml:"-" env:"RATE_LIMIT_USE_MEMORY_FALLBACK"`
+	RateLimitForceMemory       *bool  `json:"-" yaml:"-" env:"RATE_LIMIT_FORCE_MEMORY"`
+	RateLimitMemoryMaxEntries  int    `json:"-" yaml:"-" env:"RATE_LIMIT_MEMORY_MAX_ENTRIES"`
+	RateLimitMapFullPolicy     string `json:"-" yaml:"-" env:"RATE_LIMIT_MEMORY_MAP_FULL_POLICY"`
+}
+
+// RateLimitConfig is the counter store (not HTTP policy). Only this nested
+// block may use an in-process map — sessions and cache stay Valkey-only.
+type RateLimitConfig struct {
+	UseMemoryFallback   *bool  `json:"use_memory_fallback,omitempty" yaml:"use_memory_fallback,omitempty"`
+	ForceMemory         *bool  `json:"force_memory,omitempty" yaml:"force_memory,omitempty"`
+	MemoryMaxEntries    int    `json:"memory_max_entries,omitempty" yaml:"memory_max_entries,omitempty"`
+	MemoryMapFullPolicy string `json:"memory_map_full_policy,omitempty" yaml:"memory_map_full_policy,omitempty"`
 }
 
 // Option configures the state component at construction time.
 type Option func(*options)
 
 type options struct {
-	loaded       *StateConfig // set by WithConfig; overrides option-set defaults
-	configSource string       // named configuration source for live reload
-	configPath   string       // source file path (module self-registration)
-	srcEnvPrefix string       // source env overlay prefix (default: NAME_)
-	srcFormat    cf_configuration.Format
-	srcFormatSet bool
-	sessionTTL   time.Duration
-	cacheTTL     time.Duration
-	valkeyName   string // valkey peer component name; empty means ComponentName
-	logger       *slog.Logger
-	loggerSet    bool   // true when WithLogger was called explicitly
-	name         string // custom component name; empty means use ComponentName
+	loaded            *StateConfig // set by WithConfig; overrides option-set defaults
+	configSource      string       // named configuration source for live reload
+	configPath        string       // source file path (module self-registration)
+	srcEnvPrefix      string       // source env overlay prefix (default: NAME_)
+	srcFormat         cf_configuration.Format
+	srcFormatSet      bool
+	sessionTTL        time.Duration
+	cacheTTL          time.Duration
+	valkeyName        string // valkey peer component name; empty means ComponentName
+	logger            *slog.Logger
+	loggerSet         bool   // true when WithLogger was called explicitly
+	name              string // custom component name; empty means use ComponentName
+	requireValkey     bool
+	useMemoryFallback *bool
+	forceMemory       *bool
+	memoryMaxEntries  int
+	memoryMapFull     string
 }
 
 // SourceOption configures the self-registered configuration source created by
@@ -170,6 +193,30 @@ func WithValkeyName(name string) Option {
 	return func(o *options) { o.valkeyName = name }
 }
 
+// WithoutValkeyPeer omits valkey from GetDependencies (GH App / counters-only
+// sticky notes). Init then requires rate_limit memory (use_memory_fallback or
+// force_memory) plus memory_map_full_policy. Sessions and cache error: there
+// is no fridge.
+func WithoutValkeyPeer() Option {
+	return func(o *options) { o.requireValkey = false }
+}
+
+// WithUseMemoryFallback enables the counter sticky-note map when Valkey
+// Eval fails or Client() is nil.
+func WithUseMemoryFallback(enabled bool) Option {
+	return func(o *options) { o.useMemoryFallback = &enabled }
+}
+
+// WithForceMemory prefers the counter map even when a live Valkey client exists.
+func WithForceMemory(enabled bool) Option {
+	return func(o *options) { o.forceMemory = &enabled }
+}
+
+// WithMemoryMapFullPolicy sets "allow" or "deny" when the counter map is full.
+func WithMemoryMapFullPolicy(policy string) Option {
+	return func(o *options) { o.memoryMapFull = policy }
+}
+
 // WithLogger overrides the logger used for component diagnostics. By default
 // the component logs through the framework logs component (declared in
 // GetDependencies); WithLogger is an explicit override for tests and embedded
@@ -220,31 +267,58 @@ type CFState struct {
 	cacheMisses     atomic.Uint64
 	rateAllowed     atomic.Uint64
 	rateRejected    atomic.Uint64
+	rateMemoryPath  atomic.Uint64
+	rateMissingTTL  atomic.Uint64
 	reloads         atomic.Uint64
+
+	initialized       atomic.Bool
+	requireValkey     bool
+	useMemoryFallback bool
+	forceMemory       bool
+	memoryMaxEntries  int
+	mapFullPolicy     MapFullPolicy
+	mapFullPolicySet  bool
+	memory            *memoryLimiter
 }
 
 // New creates a state component. The valkey peer is resolved at Init, not here.
 func New(opts ...Option) *CFState {
 	o := options{
-		logger:     slog.Default(),
-		sessionTTL: defaultSessionTTL,
-		cacheTTL:   defaultCacheTTL,
+		logger:        slog.Default(),
+		sessionTTL:    defaultSessionTTL,
+		cacheTTL:      defaultCacheTTL,
+		requireValkey: true,
 	}
 	for _, opt := range opts {
 		opt(&o)
 	}
 	c := &CFState{
-		configSource: o.configSource,
-		configPath:   o.configPath,
-		srcEnvPrefix: o.srcEnvPrefix,
-		srcFormat:    o.srcFormat,
-		srcFormatSet: o.srcFormatSet,
-		sessionTTL:   o.sessionTTL,
-		cacheTTL:     o.cacheTTL,
-		valkeyName:   o.valkeyName,
-		logger:       o.logger,
-		loggerSet:    o.loggerSet,
-		name:         o.name,
+		configSource:     o.configSource,
+		configPath:       o.configPath,
+		srcEnvPrefix:     o.srcEnvPrefix,
+		srcFormat:        o.srcFormat,
+		srcFormatSet:     o.srcFormatSet,
+		sessionTTL:       o.sessionTTL,
+		cacheTTL:         o.cacheTTL,
+		valkeyName:       o.valkeyName,
+		logger:           o.logger,
+		loggerSet:        o.loggerSet,
+		name:             o.name,
+		requireValkey:    o.requireValkey,
+		memoryMaxEntries: defaultMemoryMaxEntries,
+		memory:           newMemoryLimiter(),
+	}
+	if o.useMemoryFallback != nil {
+		c.useMemoryFallback = *o.useMemoryFallback
+	}
+	if o.forceMemory != nil {
+		c.forceMemory = *o.forceMemory
+	}
+	if o.memoryMaxEntries > 0 {
+		c.memoryMaxEntries = o.memoryMaxEntries
+	}
+	if o.memoryMapFull != "" {
+		c.applyMapFullPolicy(o.memoryMapFull)
 	}
 	if o.loaded != nil {
 		c.applyConfig(*o.loaded)
@@ -262,6 +336,53 @@ func (c *CFState) applyConfig(cfg StateConfig) {
 	if cfg.CacheTTLSec > 0 {
 		c.cacheTTL = time.Duration(cfg.CacheTTLSec) * time.Second
 	}
+	rl := cfg.RateLimit
+	if cfg.RateLimitUseMemoryFallback != nil {
+		rl.UseMemoryFallback = cfg.RateLimitUseMemoryFallback
+	}
+	if cfg.RateLimitForceMemory != nil {
+		rl.ForceMemory = cfg.RateLimitForceMemory
+	}
+	if cfg.RateLimitMemoryMaxEntries > 0 {
+		rl.MemoryMaxEntries = cfg.RateLimitMemoryMaxEntries
+	}
+	if cfg.RateLimitMapFullPolicy != "" {
+		rl.MemoryMapFullPolicy = cfg.RateLimitMapFullPolicy
+	}
+	if rl.UseMemoryFallback != nil {
+		c.useMemoryFallback = *rl.UseMemoryFallback
+	}
+	if rl.ForceMemory != nil {
+		c.forceMemory = *rl.ForceMemory
+	}
+	if rl.MemoryMaxEntries > 0 {
+		c.memoryMaxEntries = rl.MemoryMaxEntries
+	}
+	if rl.MemoryMapFullPolicy != "" {
+		c.applyMapFullPolicy(rl.MemoryMapFullPolicy)
+	}
+}
+
+func (c *CFState) applyMapFullPolicy(s string) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "allow":
+		c.mapFullPolicy = MapFullAllow
+		c.mapFullPolicySet = true
+	case "deny":
+		c.mapFullPolicy = MapFullDeny
+		c.mapFullPolicySet = true
+	}
+}
+
+func (c *CFState) validateRateLimitMemory() error {
+	needMap := c.useMemoryFallback || c.forceMemory || !c.requireValkey
+	if !c.requireValkey && !c.useMemoryFallback && !c.forceMemory {
+		return errors.New(`cf_valkey_state: WithoutValkeyPeer requires rate_limit.use_memory_fallback or force_memory`)
+	}
+	if needMap && (c.useMemoryFallback || c.forceMemory) && !c.mapFullPolicySet {
+		return errors.New(`cf_valkey_state: rate_limit.memory_map_full_policy is required ("allow" or "deny") when counter memory is on`)
+	}
+	return nil
 }
 
 // Name implements cf.CaerusComponent. Returns the custom name set via WithName,
@@ -282,9 +403,13 @@ func (c *CFState) GetInitOrderStage() cf.Stage { return ComponentStage }
 // component, and depends on configuration when WithConfigSource is set. Peer
 // names are fixed at construction, so the graph is stable before Init.
 func (c *CFState) GetDependencies() []string {
-	deps := []string{cf_valkey.ComponentName, cf_logs.ComponentName}
-	if c.valkeyName != "" {
-		deps[0] = c.valkeyName
+	deps := []string{cf_logs.ComponentName}
+	if c.requireValkey {
+		peer := cf_valkey.ComponentName
+		if c.valkeyName != "" {
+			peer = c.valkeyName
+		}
+		deps = append([]string{peer}, deps...)
 	}
 	if c.configSource != "" {
 		deps = append(deps, cf_configuration.ComponentName)
@@ -298,8 +423,8 @@ func (c *CFState) GetDependencies() []string {
 func (c *CFState) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.vk != nil {
-		return nil // already initialized
+	if c.initialized.Load() {
+		return nil
 	}
 	c.fw = fw
 	if !c.loggerSet {
@@ -312,6 +437,14 @@ func (c *CFState) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 			return err
 		}
 	}
+	if err := c.validateRateLimitMemory(); err != nil {
+		return err
+	}
+	if !c.requireValkey {
+		c.logger.Warn("cf_valkey_state: running without a valkey peer (counter sticky-note chassis) — not shared across replicas; sessions/cache will error")
+		c.initialized.Store(true)
+		return nil
+	}
 	var vk *cf_valkey.CFValkey
 	var ok bool
 	if c.valkeyName == "" {
@@ -322,10 +455,14 @@ func (c *CFState) Init(ctx context.Context, fw *cf.CaerusFramework) error {
 	if !ok {
 		return fmt.Errorf("cf_valkey_state: valkey component %q is not registered (add it to the framework and to GetDependencies)", c.peerName())
 	}
-	if vk.Client() == nil {
-		return fmt.Errorf("cf_valkey_state: valkey component %q is not initialized", c.peerName())
-	}
 	c.vk = vk
+	if vk.Client() == nil {
+		c.logger.Error("cf_valkey_state: valkey peer has no live client (DegradedMode or not yet connected); Init continues; sessions/cache error until Client() is live; counters follow rate_limit memory settings")
+	}
+	if c.forceMemory && vk.Client() != nil {
+		c.logger.Error("cf_valkey_state: lame_memory_mode — force_memory on while valkey client is live; sticky-note counters are weaker than shared Valkey")
+	}
+	c.initialized.Store(true)
 	return nil
 }
 
@@ -609,7 +746,11 @@ func (c *CFState) CacheGetOrLoad(ctx context.Context, ttl time.Duration, load Lo
 		if lerr != nil {
 			return nil, lerr
 		}
-		if serr := client.Do(ctx, client.B().Set().Key(key).Value(string(b)).Px(ttl).Build()).Error(); serr != nil {
+		setClient, serr := c.client()
+		if serr != nil {
+			return b, serr
+		}
+		if serr := setClient.Do(ctx, setClient.B().Set().Key(key).Value(string(b)).Px(ttl).Build()).Error(); serr != nil {
 			return b, serr
 		}
 		return b, nil
@@ -623,67 +764,6 @@ func (c *CFState) CacheGetOrLoad(ctx context.Context, ttl time.Duration, load Lo
 	return val, shared, err
 }
 
-// RateLimitResult reports the outcome of a RateLimit check.
-type RateLimitResult struct {
-	// Allowed is true when Count does not exceed the limit for the window.
-	Allowed bool
-	// Count is the incremented request count within the current window.
-	Count int64
-	// ResetIn is the time remaining until the window resets (for Retry-After).
-	ResetIn time.Duration
-}
-
-// RateLimit is an atomic fixed-window rate limiter. Each call increments the
-// counter at rl:<key> and reports whether the resulting count is within limit
-// for the window. The counter and its expiry are set atomically (Lua), so a
-// key never leaks without a TTL and concurrent first calls cannot race the
-// expiry.
-//
-// The key is caller-chosen (e.g. "login:user@example.com" or "ip:1.2.3.4").
-// A transport error is returned to the caller: fail-open/fail-closed policy
-// belongs to the app (auth-api keeps its "valkey down → allow request" choice).
-func (c *CFState) RateLimit(ctx context.Context, key string, limit int64, window time.Duration) (RateLimitResult, error) {
-	client, err := c.client()
-	if err != nil {
-		return RateLimitResult{}, err
-	}
-	if key == "" {
-		return RateLimitResult{}, errors.New("cf_valkey_state: RateLimit: empty key")
-	}
-	if limit < 0 {
-		limit = 0
-	}
-	if window <= 0 {
-		window = time.Second
-	}
-	resp := client.Do(ctx, client.B().Eval().Script(luaRateLimit).
-		Numkeys(1).
-		Key(c.rlKey(key)).
-		Arg(strconv.FormatInt(window.Milliseconds(), 10)).
-		Build())
-	if resp.Error() != nil {
-		return RateLimitResult{}, resp.Error()
-	}
-	vals, err := resp.AsIntSlice()
-	if err != nil {
-		return RateLimitResult{}, err
-	}
-	res := RateLimitResult{ResetIn: window}
-	if len(vals) >= 1 {
-		res.Count = vals[0]
-	}
-	if len(vals) >= 2 && vals[1] > 0 {
-		res.ResetIn = time.Duration(vals[1]) * time.Millisecond
-	}
-	res.Allowed = res.Count <= limit
-	if res.Allowed {
-		c.rateAllowed.Add(1)
-	} else {
-		c.rateRejected.Add(1)
-	}
-	return res, nil
-}
-
 // OnConfigReload implements cf.ConfigReloader. It re-reads the behavior
 // tunables (session/cache TTLs) from the bound configuration source. No
 // connection is rebuilt: the valkey peer owns client rotation, and this
@@ -691,7 +771,7 @@ func (c *CFState) RateLimit(ctx context.Context, key string, limit int64, window
 func (c *CFState) OnConfigReload(source string, cfg any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if source != c.configSource || c.vk == nil || c.fw == nil {
+	if source != c.configSource || !c.initialized.Load() || c.fw == nil {
 		return
 	}
 	if _, ok := cfg.(*StateConfig); !ok {
@@ -748,6 +828,7 @@ func (c *CFState) Shutdown(ctx context.Context) error {
 		c.logsSub = nil
 	}
 	c.vk = nil
+	c.initialized.Store(false)
 	return nil
 }
 
@@ -776,6 +857,12 @@ func (c *CFState) Key(parts ...string) string {
 // valkey client is initialized; real connectivity is owned by the valkey
 // component's own Health (aggregated by observability's /readyz).
 func (c *CFState) Health(ctx context.Context) error {
+	if !c.initialized.Load() {
+		return errors.New("cf_valkey_state: component is not initialized")
+	}
+	if !c.requireValkey {
+		return nil
+	}
 	vk := c.peer()
 	if vk == nil || vk.Client() == nil {
 		return errors.New("cf_valkey_state: valkey client is not initialized")
@@ -789,10 +876,16 @@ func (c *CFState) Health(ctx context.Context) error {
 // pickup). Counters are cumulative for the process lifetime and are emitted
 // (zero until first fired) so the series are always present.
 func (c *CFState) Metrics() []cf_observability.Metric {
-	if c.Client() == nil {
+	if !c.initialized.Load() {
 		return nil
 	}
 	labels := map[string]string{"component": c.Name()}
+	bool01 := func(b bool) float64 {
+		if b {
+			return 1
+		}
+		return 0
+	}
 	ms := []cf_observability.Metric{
 		{
 			Name:   "valkey_state_info",
@@ -855,6 +948,32 @@ func (c *CFState) Metrics() []cf_observability.Metric {
 			Value:  float64(c.rateRejected.Load()),
 			Labels: copyLabels(labels),
 			Type:   cf_observability.MetricTypeCounter,
+		},
+		{
+			Name:   "valkey_state_rate_memory_path_total",
+			Help:   "Total number of counter Allow calls served from the in-process map.",
+			Value:  float64(c.rateMemoryPath.Load()),
+			Labels: copyLabels(labels),
+			Type:   cf_observability.MetricTypeCounter,
+		},
+		{
+			Name:   "valkey_state_rate_missing_ttl_total",
+			Help:   "Times a Valkey counter was scrubbed for count>0 and PTTL<=0.",
+			Value:  float64(c.rateMissingTTL.Load()),
+			Labels: copyLabels(labels),
+			Type:   cf_observability.MetricTypeCounter,
+		},
+		{
+			Name:   "valkey_state_rate_force_memory",
+			Help:   "1 when rate_limit.force_memory is on.",
+			Value:  bool01(c.forceMemory),
+			Labels: copyLabels(labels),
+		},
+		{
+			Name:   "valkey_state_rate_use_memory_fallback",
+			Help:   "1 when rate_limit.use_memory_fallback is on.",
+			Value:  bool01(c.useMemoryFallback),
+			Labels: copyLabels(labels),
 		},
 	}
 	return ms
