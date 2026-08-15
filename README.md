@@ -128,18 +128,41 @@ val, shared, _ := st.CacheGetOrLoad(ctx, time.Minute, func(ctx context.Context) 
 // concurrent callers coalesce onto one load (process-local singleflight)
 
 // rate limiting — atomic fixed-window counter (Lua)
-res, _ := st.RateLimit(ctx, "login:"+email, 5, time.Minute)
-if !res.Allowed {
-	// respond 429; res.ResetIn is the window time remaining (Retry-After)
+res, err := st.Allow(ctx, "login:"+email, 5, time.Minute)
+if err != nil {
+	// store failed; HTTP fail-open/fail-closed lives on http-ratelimiter
 }
-// res.Count is the current count within the window
+if !res.Allowed {
+	// for HTTP, prefer caerus-framework-http-ratelimiter Middleware
+}
+// Direct Allow/Peek/Reset is the RateLimiter *machine* (Lua or nested
+// rate_limit memory). Do not use it for login lockout from auth — use the
+// HTTP limiter, which calls this machine.
 ```
 
 `CacheGetOrLoad`'s `load` runs at most once per key per in-flight wave inside
-this process (same singleflight semantics as the valkey `patterns` package);
-other pods still stampede on a cold key — compose with a valkey `patterns`
-mutex for cross-pod coalescing. Rate-limit errors are returned to the caller:
-fail-open/fail-closed policy belongs to the app.
+this process. SET after load re-resolves `Client()` so a valkey reload mid-flight
+does not write to a closed handle. Other pods still stampede on a cold key.
+
+**HTTP / login / IP caps** belong on `caerus-framework-http-ratelimiter`. This
+module owns how the count is stored.
+
+### Counter store (`rate_limit`)
+
+State **chooses** Valkey Lua vs the sticky-note map from nested settings. The
+app does not pass “use memory on this call.” Only counters get a map —
+sessions and cache always need a live Valkey client.
+
+| Setting | Meaning |
+|---|---|
+| `force_memory` | Always use the map (GH App / laptop). |
+| `use_memory_fallback` | Lua first; on nil client or Eval error, use the map. |
+| `memory_map_full_policy` | `allow` or `deny` when the map hits its cap (required when memory is on). |
+
+`WithoutValkeyPeer()` omits valkey from `GetDependencies` (GH App). Init then
+requires memory on. `CreateSession` / cache error. `Health` is ready (nothing
+mixed). Mixed app (sessions + counters, one valkey) + DegradedMode: Init may
+succeed; `/readyz` stays red while `Client()` is nil — **no LB traffic**.
 
 ## Options
 
@@ -149,7 +172,10 @@ fail-open/fail-closed policy belongs to the app.
 | `WithConfigSource(name, path, …)` | bind a configuration source for Init + `OnConfigReload`; the module registers the `Source[StateConfig]` itself (declares `configuration` dep) |
 | `WithSessionTTL(d)` | default session TTL when a call leaves ttl at zero (default `24h`) |
 | `WithCacheTTL(d)` | default cache TTL when a call leaves ttl at zero (default `5m`) |
-| `WithValkeyName(name)` | bind to a named valkey peer (`WithName` on the valkey side; default `"valkey"`) |
+| `WithValkeyName(name)` | bind to a named valkey peer (default `"valkey"`) |
+| `WithoutValkeyPeer()` | omit valkey (counter memory only; sessions/cache error) |
+| `WithUseMemoryFallback(bool)` / `WithForceMemory(bool)` | counter map (see `rate_limit`) |
+| `WithMemoryMapFullPolicy("allow"\|"deny")` | required when counter memory is on |
 | `WithName(name)` | custom component name for multiple instances (default `"valkey-state"`) |
 | `WithLogger(*slog.Logger)` | explicit logger override; defaults to the framework `logs` component's logger (re-delivered on `logs` `Reconfigure`), falling back to `slog.Default()` |
 
@@ -163,9 +189,18 @@ source name `"valkey-state"`, the default `EnvPrefix` is `VALKEY_STATE_`;
 ```json
 {
   "session_ttl_sec": 86400,
-  "cache_ttl_sec": 300
+  "cache_ttl_sec": 300,
+  "rate_limit": {
+    "use_memory_fallback": true,
+    "force_memory": false,
+    "memory_map_full_policy": "deny"
+  }
 }
 ```
+
+File/YAML may nest `rate_limit`. Env overlay does not recurse nested structs;
+use `VALKEY_STATE_RATE_LIMIT_USE_MEMORY_FALLBACK`, `_FORCE_MEMORY`,
+`_MEMORY_MAX_ENTRIES`, `_MEMORY_MAP_FULL_POLICY`.
 
 The tunables apply live: on reload `OnConfigReload` re-reads the source and
 replaces the TTL defaults (last-good on failure). The valkey peer owns

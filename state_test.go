@@ -2,6 +2,7 @@ package cf_valkey_state
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -100,6 +101,12 @@ func TestGetDependencies(t *testing.T) {
 	if deps[2] != "configuration" {
 		t.Fatalf("GetDependencies() with source = %v, want configuration last", deps)
 	}
+
+	mem := New(WithoutValkeyPeer(), WithUseMemoryFallback(true), WithMemoryMapFullPolicy("allow"))
+	deps = mem.GetDependencies()
+	if len(deps) != 1 || deps[0] != "logs" {
+		t.Fatalf("WithoutValkeyPeer GetDependencies() = %v, want [logs]", deps)
+	}
 }
 
 func TestInitRequiresValkey(t *testing.T) {
@@ -124,18 +131,61 @@ func TestInitWithNamedValkeyMissing(t *testing.T) {
 	}
 }
 
-func TestInitRequiresValkeyInitialized(t *testing.T) {
+func TestInitSoftWhenValkeyClientNil(t *testing.T) {
 	fw := cf.New()
 	if err := fw.AddComponent(cf_valkey.New()); err != nil {
 		t.Fatalf("AddComponent: %v", err)
 	}
 	s := New()
-	err := s.Init(context.Background(), fw)
-	if err == nil {
-		t.Fatal("Init against an uninitialized valkey should fail")
+	if err := s.Init(context.Background(), fw); err != nil {
+		t.Fatalf("soft-init should succeed when valkey is registered but Client() is nil: %v", err)
 	}
-	if !strings.Contains(err.Error(), "is not initialized") {
-		t.Fatalf("Init error = %v, want a valkey-not-initialized error", err)
+	if err := s.Health(context.Background()); err == nil {
+		t.Fatal("Health should fail while the valkey client is nil (mixed /readyz stays red)")
+	}
+	if _, err := s.Allow(context.Background(), "k", 1, time.Minute); err == nil {
+		t.Fatal("Allow without memory and without client should error")
+	}
+}
+
+func TestInitMemoryOnlyWithoutValkey(t *testing.T) {
+	s := New(WithoutValkeyPeer(), WithForceMemory(true), WithUseMemoryFallback(true), WithMemoryMapFullPolicy("allow"))
+	if err := s.Init(context.Background(), cf.New()); err != nil {
+		t.Fatalf("memory-only Init: %v", err)
+	}
+	if err := s.Health(context.Background()); err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	res, err := s.Allow(context.Background(), "login:1", 2, time.Minute)
+	if err != nil {
+		t.Fatalf("Allow: %v", err)
+	}
+	if !res.Allowed || res.Count != 1 {
+		t.Fatalf("Allow = %+v, want allowed count 1", res)
+	}
+	if err := s.CreateSession(context.Background(), "id", map[string]string{"a": "b"}, time.Minute); err == nil {
+		t.Fatal("CreateSession without valkey should error")
+	}
+}
+
+func TestInitWithoutValkeyRequiresMemory(t *testing.T) {
+	s := New(WithoutValkeyPeer())
+	err := s.Init(context.Background(), cf.New())
+	if err == nil {
+		t.Fatal("WithoutValkeyPeer without memory should fail Init")
+	}
+}
+
+func TestAllowRejectsBadWindow(t *testing.T) {
+	s := New(WithoutValkeyPeer(), WithForceMemory(true), WithMemoryMapFullPolicy("allow"))
+	if err := s.Init(context.Background(), cf.New()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Allow(context.Background(), "k", 1, 0); !errors.Is(err, ErrInvalidWindow) {
+		t.Fatalf("err = %v, want ErrInvalidWindow", err)
+	}
+	if _, err := s.Allow(context.Background(), "k", 0, time.Minute); !errors.Is(err, ErrInvalidLimit) {
+		t.Fatalf("err = %v, want ErrInvalidLimit", err)
 	}
 }
 
@@ -145,14 +195,11 @@ func TestInitResolvesValkeyByName(t *testing.T) {
 		t.Fatalf("AddComponent: %v", err)
 	}
 	s := New(WithValkeyName("cache"))
-	err := s.Init(context.Background(), fw)
-	if err == nil {
-		t.Fatal("Init against an uninitialized named valkey should fail")
+	if err := s.Init(context.Background(), fw); err != nil {
+		t.Fatalf("soft-init named peer: %v", err)
 	}
-	// Finding the "cache" peer proves the by-name resolution worked; the only
-	// failure left is the uninitialized client.
-	if !strings.Contains(err.Error(), `valkey component "cache" is not initialized`) {
-		t.Fatalf("Init error = %v, want a cache-not-initialized error", err)
+	if s.peer() == nil || s.peer().Name() != "cache" {
+		t.Fatal("expected named valkey peer stored")
 	}
 }
 
