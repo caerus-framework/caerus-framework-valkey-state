@@ -3,12 +3,12 @@ module github.com/caerus-framework/caerus-framework-valkey-state
 go 1.26
 
 require (
-	github.com/caerus-framework/caerus-framework v0.0.10
-	github.com/caerus-framework/caerus-framework-configuration v0.0.9
-	github.com/caerus-framework/caerus-framework-logs v0.0.8
-	github.com/caerus-framework/caerus-framework-observability v0.0.7
-	github.com/caerus-framework/caerus-framework-valkey v0.0.8
-	github.com/valkey-io/valkey-go v1.0.76
+	github.com/caerus-framework/caerus-framework v0.0.11
+	github.com/caerus-framework/caerus-framework-configuration v0.0.10
+	github.com/caerus-framework/caerus-framework-logs v0.0.9
+	github.com/caerus-framework/caerus-framework-observability v0.0.8
+	github.com/caerus-framework/caerus-framework-valkey v0.0.9
+	github.com/valkey-io/valkey-go v1.0.77
 	golang.org/x/sync v0.22.0
 )
 
@@ -34,11 +34,11 @@ require (
 	go.opentelemetry.io/otel/sdk v1.45.0 // indirect
 	go.opentelemetry.io/otel/trace v1.45.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
-	golang.org/x/mod v0.39.0 // indirect
+	golang.org/x/mod v0.40.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
-	golang.org/x/tools v0.48.0 // indirect
+	golang.org/x/tools v0.49.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260810153831-ec0a7760b754 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260810153831-ec0a7760b754 // indirect
 	google.golang.org/grpc v1.83.0 // indirect
