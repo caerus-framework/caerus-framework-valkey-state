@@ -4,19 +4,23 @@
 [![codecov](https://codecov.io/gh/caerus-framework/caerus-framework-valkey-state/graph/badge.svg)](https://codecov.io/gh/caerus-framework/caerus-framework-valkey-state)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Caerus Framework Valkey State Component. Keyed state services — **sessions**,
-**cache**, and **rate limiting** — built on top of the
-[caerus-framework-valkey](https://github.com/caerus-framework/caerus-framework-valkey)
-component, so apps (e.g. `caerus-auth-api`) don't import valkey-go or manage
-keys/TTLs themselves. Framework-owned lifecycle, configuration (file + env +
-flags), live tunable reload with last-good semantics, logging through the
-framework `logs` component, and observability health/metrics.
+Caerus Framework Valkey State Component. Keyed state services — **sessions**
+(by id plus an optional per-user SET index), **cache**, and **rate-limit
+counters** — on top of
+[caerus-framework-valkey](https://github.com/caerus-framework/caerus-framework-valkey).
+Apps do not import valkey-go or invent `KEYS` scans. Framework-owned
+lifecycle, configuration (file + env + flags), live tunable reload with
+last-good, logging through `logs`, observability health/metrics.
+
+This is **not** valkey-queues (VPQ / jobs). Queues and state are siblings
+on the same fridge; neither owns the other. HTTP 429 / `KeyFunc` /
+fail-open stay on
+[caerus-framework-http-ratelimiter](https://github.com/caerus-framework/caerus-framework-http-ratelimiter).
+This module stores the count.
 
 The component is a stateless **consumer** of a `CFValkey` peer: it holds the
-peer component pointer (never a client snapshot) and builds every command
-through the peer's live `Client()` and prefix-aware `Key()`, so reconnects and
-key prefixes stay consistent and the peer's `OnConfigReload` owns client
-rotation.
+peer pointer (never a client snapshot) and uses live `Client()` and
+prefix-aware `Key()`. Reconnects stay on the valkey component.
 
 ## Wiring
 
@@ -102,56 +106,86 @@ source name (e.g. `"state"`) — then remember `GetDependencies` must use
 
 ## Usage
 
-The app resolves the component once at `Init` (see Wiring above) and calls the
-accessors per use. All keys are namespaced (`session:*`, `cache:*`, `rl:*`) and
-built through the peer's prefix-aware `Key()`, so the valkey `WithKeyPrefix`
-applies on top.
+The app resolves the component once at `Init` and calls accessors per use.
+Keys go through the peer’s `Key()` (`session:*`, `session-bind:*`,
+`session-user:*`, `cache:*`, `rl:*`) plus valkey `WithKeyPrefix`.
+
+`CFState.Key(parts…)` is the same prefix helper for **other** patterns
+(e.g. `patterns.NewMutex`). Rate-limit storage keys stay unexported
+(`rlKey`). Pass the **logical** key into `Allow` / `Peek` / `Reset`
+(`login:`+email), not `prod:rl:login:…`.
+
+### Sessions
+
+Opaque JSON at `session:<id>` with a TTL. The app chooses the id (opaque
+token). Optional **user index** (no Redis `KEYS`):
+
+| Call | What it does |
+|---|---|
+| `CreateSession(ctx, id, v, ttl)` | By id only. `ListSessionsForUser` will not see it. |
+| `CreateSession(..., WithSessionUser(userID))` | Also `SADD` `session-user:<user>` and `session-bind:<id>` (user id for SREM; the JSON is not parsed). |
+| `ListSessionsForUser(ctx, userID)` | `SMEMBERS` + `EXISTS`; expired payloads are `SREM`’d (ghosts). O(that user’s sessions). |
+| `RevokeAllForUser(ctx, userID, keep…)` | Delete every indexed session except `keep` (usually the current id). |
+| `RevokeSession` | `DEL` payload + bind and `SREM` when indexed. |
+| `TouchSession` | Sliding TTL on payload; bind and user SET PTTL bumped when indexed. |
+
+Empty session/user id is an error. Valkey/JSON errors **do not include**
+the session or user id — log those in the app if you need them.
+
+Do **not** use `Allow` / counters to list sessions. Do **not** `KEYS`.
+This module does not set cookies or CSRF tokens.
 
 ```go
-// sessions — opaque JSON values with a TTL
 sess := map[string]any{"user_id": "u1", "roles": []string{"admin"}}
-_ = st.CreateSession(ctx, "tok-abc", sess, 24*time.Hour) // ttl 0 → configured default
+_ = st.CreateSession(ctx, "tok-abc", sess, 24*time.Hour, cf_valkey_state.WithSessionUser("u1"))
 var got map[string]any
-found, _ := st.GetSession(ctx, "tok-abc", &got)          // found=false on miss/expiry
+found, _ := st.GetSession(ctx, "tok-abc", &got) // found=false on miss/expiry
 st.SessionExists(ctx, "tok-abc")
-st.TouchSession(ctx, "tok-abc", 15*time.Minute)          // sliding window
+st.TouchSession(ctx, "tok-abc", 15*time.Minute)
+ids, _ := st.ListSessionsForUser(ctx, "u1")
+_ = st.RevokeAllForUser(ctx, "u1", "tok-abc") // revoke others, keep current
 st.RevokeSession(ctx, "tok-abc")
+```
 
-// cache — JSON cache-aside with a singleflight get-or-load
+### Cache
+
+JSON cache-aside. `CacheGetOrLoad` runs `load` at most once per key per
+in-flight wave **in this process** (`singleflight`). SET after load
+re-resolves `Client()`. Other pods still stampede on a cold key.
+
+```go
 _ = st.CacheSet(ctx, someStruct, time.Minute, "catalog", "sku-1")
 var cached someStruct
-_ = st.CacheGet(ctx, &cached, "catalog", "sku-1") // no-op miss (dst untouched)
+_ = st.CacheGet(ctx, &cached, "catalog", "sku-1") // miss: no-op, dst untouched
 
 val, shared, _ := st.CacheGetOrLoad(ctx, time.Minute, func(ctx context.Context) ([]byte, error) {
 	return json.Marshal(fetchFromDB(ctx))
 }, "catalog", "sku-2")
-// concurrent callers coalesce onto one load (process-local singleflight)
-
-// rate limiting — atomic fixed-window counter (Lua)
-res, err := st.Allow(ctx, "login:"+email, 5, time.Minute)
-if err != nil {
-	// store failed; HTTP fail-open/fail-closed lives on http-ratelimiter
-}
-if !res.Allowed {
-	// for HTTP, prefer caerus-framework-http-ratelimiter Middleware
-}
-// Direct Allow/Peek/Reset is the RateLimiter *machine* (Lua or nested
-// rate_limit memory). Do not use it for login lockout from auth — use the
-// HTTP limiter, which calls this machine.
 ```
 
-`CacheGetOrLoad`'s `load` runs at most once per key per in-flight wave inside
-this process. SET after load re-resolves `Client()` so a valkey reload mid-flight
-does not write to a closed handle. Other pods still stampede on a cold key.
+### Rate-limit counters (the store, not HTTP)
 
-**HTTP / login / IP caps** belong on `caerus-framework-http-ratelimiter`. This
-module owns how the count is stored.
+Fixed-window Lua (`INCR` + `PEXPIRE` on first count) or the nested
+`rate_limit` memory map. HTTP 429 / `KeyFunc` / fail-open live on
+http-ratelimiter, which calls this machine. Login lockout from an auth
+handler should go through that HTTP limiter, not a raw `Allow` here.
 
-### Counter store (`rate_limit`)
+```go
+res, err := st.Allow(ctx, "login:"+email, 5, time.Minute)
+if err != nil {
+	// store failed; FailOpen / FailClosed is the HTTP module
+}
+```
 
-State **chooses** Valkey Lua vs the sticky-note map from nested settings. The
-app does not pass “use memory on this call.” Only counters get a map —
-sessions and cache always need a live Valkey client.
+`Peek` / `Reset` use the same logical key. There is no public
+`RateLimitKey`. Sliding window / token bucket are not shipped; this is
+fixed-window until a named product needs more Lua **here**.
+
+### Counter store settings (`rate_limit`)
+
+State **chooses** Lua vs the sticky-note map from nested file settings.
+The app does not pass “use memory on this call.” Only **counters** get a
+map — sessions and cache always need a live Valkey client.
 
 | Setting | Meaning |
 |---|---|
@@ -159,10 +193,34 @@ sessions and cache always need a live Valkey client.
 | `use_memory_fallback` | Lua first; on nil client or Eval error, use the map. |
 | `memory_map_full_policy` | `allow` or `deny` when the map hits its cap (required when memory is on). |
 
-`WithoutValkeyPeer()` omits valkey from `GetDependencies` (GH App). Init then
-requires memory on. `CreateSession` / cache error. `Health` is ready (nothing
-mixed). Mixed app (sessions + counters, one valkey) + DegradedMode: Init may
-succeed; `/readyz` stays red while `Client()` is nil — **no LB traffic**.
+### Health (`/readyz`)
+
+State does **not** PING. Valkey’s `Health` already PINGs. Two shapes:
+
+| Wiring | After Init, `Health` |
+|---|---|
+| **Path A** — `WithoutValkeyPeer` + memory on (counters only) | **Ready.** No fridge. Sessions/cache still error. |
+| **Path B** — valkey declared (normal app) | **Ready only if `Client()` is non-nil.** Soft-init / DegradedMode can finish Init with a nil client; `/readyz` stays **red** until the peer connects. |
+
+DegradedMode answers “may Initialize finish?” `/readyz` answers “send
+LB traffic?” Do not mix them.
+
+### GH App / laptop counters without Valkey
+
+No session store in-process. Construct state **without** a valkey
+component; turn memory on. `main` does not add `cf_valkey`.
+
+```go
+cf_valkey_state.New(
+	cf_valkey_state.WithoutValkeyPeer(),
+	cf_valkey_state.WithForceMemory(true),
+	cf_valkey_state.WithMemoryMapFullPolicy("deny"),
+	cf_valkey_state.WithConfigSource("valkey-state", "config/valkey-state.json"),
+)
+```
+
+Init fails if memory is off. Mixed app (sessions + counters, **one**
+valkey) uses Path B Health, not this recipe.
 
 ## Options
 
@@ -171,6 +229,7 @@ succeed; `/readyz` stays red while `Client()` is nil — **no LB traffic**.
 | `WithConfig(StateConfig)` | static config snapshot; non-zero fields override option-set defaults |
 | `WithConfigSource(name, path, …)` | bind a configuration source for Init + `OnConfigReload`; the module registers the `Source[StateConfig]` itself (declares `configuration` dep) |
 | `WithSessionTTL(d)` | default session TTL when a call leaves ttl at zero (default `24h`) |
+| `WithSessionUser` on `CreateSession` | index that session under a user SET (list / revoke-all) |
 | `WithCacheTTL(d)` | default cache TTL when a call leaves ttl at zero (default `5m`) |
 | `WithValkeyName(name)` | bind to a named valkey peer (default `"valkey"`) |
 | `WithoutValkeyPeer()` | omit valkey (counter memory only; sessions/cache error) |
@@ -200,16 +259,16 @@ source name `"valkey-state"`, the default `EnvPrefix` is `VALKEY_STATE_`;
 
 File/YAML may nest `rate_limit`. Env overlay does not recurse nested structs;
 use `VALKEY_STATE_RATE_LIMIT_USE_MEMORY_FALLBACK`, `_FORCE_MEMORY`,
-`_MEMORY_MAX_ENTRIES`, `_MEMORY_MAP_FULL_POLICY`.
+`_MEMORY_MAX_ENTRIES`, `_MEMORY_MAP_FULL_POLICY`. Do not flatten those
+switches onto the top of the JSON next to `session_ttl_sec` — the nested
+object is the counter store, not HTTP policy and not session TTLs.
 
 The tunables apply live: on reload `OnConfigReload` re-reads the source and
 replaces the TTL defaults (last-good on failure). The valkey peer owns
 connection rotation, so a reload never rebuilds anything here.
 
-`Health` reports initialized/uninitialized (the peer's client is the liveness
-source; real connectivity is the valkey component's own `Health`, aggregated by
-observability's `/readyz`). `Metrics` emits the following while initialized,
-nil before Init/after Shutdown:
+`Metrics` emits the following while initialized, nil before Init/after
+Shutdown:
 
 | Metric | Type | Labels |
 | --- | --- | --- |
@@ -233,7 +292,7 @@ rate-limit rejection rate is `rate(valkey_state_rate_rejected_total[5m])`.
 Unit tests cover the component contract, options/config layering, dependency
 declaration, and Init failure modes with no external service. Integration tests
 (real session/cache/rate-limit behavior, TTL expiry, sliding-window touch,
-singleflight coalescing, Lua atomicity) run only when the gate env var is set:
+user session index, singleflight coalescing, Lua atomicity) run only when the gate env var is set:
 
 ```bash
 docker run -d --rm -p 6379:6379 --name v valkey/valkey:8

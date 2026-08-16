@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -112,6 +113,121 @@ func TestIntegrationSessionLifecycle(t *testing.T) {
 	}
 	if found {
 		t.Fatal("GetSession should miss after revoke")
+	}
+}
+
+func TestIntegrationSessionIndex(t *testing.T) {
+	s, raw := setupState(t)
+	ctx := context.Background()
+	u := "user-a"
+	if err := s.CreateSession(ctx, "a1", testSession{UserID: u}, 10*time.Second, WithSessionUser(u)); err != nil {
+		t.Fatalf("CreateSession a1: %v", err)
+	}
+	if err := s.CreateSession(ctx, "a2", testSession{UserID: u}, 10*time.Second, WithSessionUser(u)); err != nil {
+		t.Fatalf("CreateSession a2: %v", err)
+	}
+	if err := s.CreateSession(ctx, "b1", testSession{UserID: "other"}, 10*time.Second, WithSessionUser("other")); err != nil {
+		t.Fatalf("CreateSession b1: %v", err)
+	}
+	if err := s.CreateSession(ctx, "orphan", testSession{UserID: u}, 10*time.Second); err != nil {
+		t.Fatalf("CreateSession orphan: %v", err)
+	}
+
+	got, err := s.ListSessionsForUser(ctx, u)
+	if err != nil {
+		t.Fatalf("ListSessionsForUser: %v", err)
+	}
+	if !sameIDs(got, []string{"a1", "a2"}) {
+		t.Fatalf("list %v, want a1 a2 (orphan is unindexed)", got)
+	}
+
+	if err := s.RevokeSession(ctx, "a1"); err != nil {
+		t.Fatalf("RevokeSession: %v", err)
+	}
+	got, err = s.ListSessionsForUser(ctx, u)
+	if err != nil {
+		t.Fatalf("list after revoke: %v", err)
+	}
+	if !sameIDs(got, []string{"a2"}) {
+		t.Fatalf("list after revoke = %v, want a2", got)
+	}
+
+	if err := raw.Do(ctx, raw.B().Del().Key(s.sessionKey("a2")).Build()).Error(); err != nil {
+		t.Fatalf("DEL ghost: %v", err)
+	}
+	got, err = s.ListSessionsForUser(ctx, u)
+	if err != nil {
+		t.Fatalf("list ghosts: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("list after ghost = %v, want empty", got)
+	}
+
+	if err := s.CreateSession(ctx, "keep", testSession{UserID: u}, 10*time.Second, WithSessionUser(u)); err != nil {
+		t.Fatalf("CreateSession keep: %v", err)
+	}
+	if err := s.CreateSession(ctx, "drop", testSession{UserID: u}, 10*time.Second, WithSessionUser(u)); err != nil {
+		t.Fatalf("CreateSession drop: %v", err)
+	}
+	if err := s.RevokeAllForUser(ctx, u, "keep"); err != nil {
+		t.Fatalf("RevokeAllForUser: %v", err)
+	}
+	got, err = s.ListSessionsForUser(ctx, u)
+	if err != nil {
+		t.Fatalf("list after revoke-all: %v", err)
+	}
+	if !sameIDs(got, []string{"keep"}) {
+		t.Fatalf("list after revoke-all = %v, want keep", got)
+	}
+	found, err := s.GetSession(ctx, "drop", &testSession{})
+	if err != nil || found {
+		t.Fatalf("drop should be gone: found=%v err=%v", found, err)
+	}
+	found, err = s.GetSession(ctx, "keep", &testSession{})
+	if err != nil || !found {
+		t.Fatalf("keep should remain: found=%v err=%v", found, err)
+	}
+	found, err = s.GetSession(ctx, "b1", &testSession{})
+	if err != nil || !found {
+		t.Fatalf("other user session should remain: found=%v err=%v", found, err)
+	}
+}
+
+func sameIDs(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	m := map[string]int{}
+	for _, id := range got {
+		m[id]++
+	}
+	for _, id := range want {
+		m[id]--
+		if m[id] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func TestIntegrationSessionUnmarshalErrorOmitsID(t *testing.T) {
+	s, raw := setupState(t)
+	ctx := context.Background()
+	const id = "sess-secret-do-not-leak"
+	key := s.sessionKey(id)
+	if err := raw.Do(ctx, raw.B().Set().Key(key).Value("not-json").Build()).Error(); err != nil {
+		t.Fatalf("SET garbage: %v", err)
+	}
+	var got testSession
+	_, err := s.GetSession(ctx, id, &got)
+	if err == nil {
+		t.Fatal("GetSession want unmarshal error")
+	}
+	if !strings.Contains(err.Error(), "unmarshal session") {
+		t.Fatalf("GetSession = %v, want unmarshal session", err)
+	}
+	if strings.Contains(err.Error(), id) {
+		t.Fatalf("unmarshal error includes session id: %v", err)
 	}
 }
 
