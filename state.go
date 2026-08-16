@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,9 +37,11 @@ const (
 // space. All keys are built through the peer's Key, so the valkey key prefix
 // (WithKeyPrefix) applies on top.
 const (
-	nsSession   = "session"
-	nsCache     = "cache"
-	nsRateLimit = "rl"
+	nsSession     = "session"
+	nsSessionBind = "session-bind"
+	nsSessionUser = "session-user"
+	nsCache       = "cache"
+	nsRateLimit   = "rl"
 )
 
 // Defaults applied when a call leaves the TTL at zero. Overridable per call
@@ -56,6 +59,69 @@ if n == 1 then
   redis.call("PEXPIRE", KEYS[1], ARGV[1])
 end
 return {n, redis.call("PTTL", KEYS[1])}`
+
+// luaSessionCreate writes the payload, optional user bind, and SADD on the
+// per-user SET. KEYS: payload, bind, user-set. ARGV: json, ttlMs, sessionId, userId.
+// Empty userId skips bind and SET (same as a session with no index).
+const luaSessionCreate = `redis.call("SET", KEYS[1], ARGV[1], "PX", ARGV[2])
+if ARGV[4] ~= "" then
+  redis.call("SET", KEYS[2], ARGV[4], "PX", ARGV[2])
+  redis.call("SADD", KEYS[3], ARGV[3])
+  local t = tonumber(ARGV[2])
+  local cur = redis.call("PTTL", KEYS[3])
+  if cur < t then
+    redis.call("PEXPIRE", KEYS[3], t)
+  end
+end
+return 1`
+
+// luaSessionRevoke deletes payload + bind and SREM from the user SET when a
+// bind exists. KEYS: payload, bind. ARGV: sessionId, userSetPrefix (ends with :).
+const luaSessionRevoke = `local user = redis.call("GET", KEYS[2])
+redis.call("DEL", KEYS[1])
+redis.call("DEL", KEYS[2])
+if type(user) == "string" and user ~= "" then
+  redis.call("SREM", ARGV[2] .. user, ARGV[1])
+end
+return 1`
+
+// luaSessionTouch extends payload TTL; if a bind exists, the same TTL on the
+// bind and at least that TTL on the user SET. KEYS: payload, bind.
+// ARGV: ttlMs, userSetPrefix.
+const luaSessionTouch = `local n = redis.call("PEXPIRE", KEYS[1], ARGV[1])
+if redis.call("EXISTS", KEYS[2]) == 1 then
+  redis.call("PEXPIRE", KEYS[2], ARGV[1])
+  local user = redis.call("GET", KEYS[2])
+  if type(user) == "string" and user ~= "" then
+    local uk = ARGV[2] .. user
+    local t = tonumber(ARGV[1])
+    local cur = redis.call("PTTL", uk)
+    if cur < t then
+      redis.call("PEXPIRE", uk, t)
+    end
+  end
+end
+return n`
+
+// luaSessionRevokeAll drops every member of the user SET except keep ids.
+// KEYS: user-set. ARGV: sessionPrefix, bindPrefix, keep...
+const luaSessionRevokeAll = `local sp = ARGV[1]
+local bp = ARGV[2]
+local keep = {}
+for i = 3, #ARGV do
+  keep[ARGV[i]] = true
+end
+local ids = redis.call("SMEMBERS", KEYS[1])
+local n = 0
+for _, id in ipairs(ids) do
+  if not keep[id] then
+    redis.call("DEL", sp .. id)
+    redis.call("DEL", bp .. id)
+    redis.call("SREM", KEYS[1], id)
+    n = n + 1
+  end
+end
+return n`
 
 // StateConfig is the file/env-drivable behavior configuration. Load it through
 // the configuration component (caerus-framework-configuration) and pass it via
@@ -514,36 +580,74 @@ func (c *CFState) client() (valkey.Client, error) {
 }
 
 func (c *CFState) sessionKey(id string) string {
+	return c.nsKey(nsSession, id)
+}
+
+func (c *CFState) sessionBindKey(id string) string {
+	return c.nsKey(nsSessionBind, id)
+}
+
+func (c *CFState) sessionUserKey(userID string) string {
+	return c.nsKey(nsSessionUser, userID)
+}
+
+func (c *CFState) sessionPrefix() string {
+	return c.nsKey(nsSession) + ":"
+}
+
+func (c *CFState) sessionBindPrefix() string {
+	return c.nsKey(nsSessionBind) + ":"
+}
+
+func (c *CFState) sessionUserPrefix() string {
+	return c.nsKey(nsSessionUser) + ":"
+}
+
+func (c *CFState) nsKey(parts ...string) string {
 	if vk := c.peer(); vk != nil {
-		return vk.Key(nsSession, id)
+		return vk.Key(parts...)
 	}
-	return strings.Join([]string{nsSession, id}, ":")
+	return strings.Join(parts, ":")
 }
 
 func (c *CFState) cacheKey(parts ...string) string {
-	if vk := c.peer(); vk != nil {
-		return vk.Key(append([]string{nsCache}, parts...)...)
-	}
-	return strings.Join(append([]string{nsCache}, parts...), ":")
+	return c.nsKey(append([]string{nsCache}, parts...)...)
 }
 
 func (c *CFState) rlKey(key string) string {
-	if vk := c.peer(); vk != nil {
-		return vk.Key(nsRateLimit, key)
-	}
-	return strings.Join([]string{nsRateLimit, key}, ":")
+	return c.nsKey(nsRateLimit, key)
+}
+
+// SessionOption configures CreateSession (user index binding).
+type SessionOption func(*sessionOpts)
+
+type sessionOpts struct {
+	userID string
+}
+
+// WithSessionUser indexes this session under userID so ListSessionsForUser and
+// RevokeAllForUser can find it. Empty userID is ignored (no index, same as
+// omitting the option). This is not inferred from the JSON value.
+func WithSessionUser(userID string) SessionOption {
+	return func(o *sessionOpts) { o.userID = userID }
 }
 
 // CreateSession stores a JSON session value at session:<id> with the given
 // TTL. A ttl <= 0 uses the configured default. The session id is chosen by the
 // caller (typically an opaque token); it is never derived from the value.
-func (c *CFState) CreateSession(ctx context.Context, id string, v any, ttl time.Duration) error {
+// Pass WithSessionUser to maintain the per-user SET (Choice A). Without it,
+// the session exists by id only — ListSessionsForUser will not see it.
+func (c *CFState) CreateSession(ctx context.Context, id string, v any, ttl time.Duration, opts ...SessionOption) error {
+	if id == "" {
+		return errors.New("cf_valkey_state: CreateSession: empty session id")
+	}
+	so := sessionOpts{}
+	for _, opt := range opts {
+		opt(&so)
+	}
 	client, err := c.client()
 	if err != nil {
 		return err
-	}
-	if id == "" {
-		return errors.New("cf_valkey_state: CreateSession: empty session id")
 	}
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -552,9 +656,16 @@ func (c *CFState) CreateSession(ctx context.Context, id string, v any, ttl time.
 	if ttl <= 0 {
 		ttl = c.sessionTTLValue()
 	}
-	key := c.sessionKey(id)
-	if err := client.Do(ctx, client.B().Set().Key(key).Value(string(b)).Px(ttl).Build()).Error(); err != nil {
-		return fmt.Errorf("cf_valkey_state: set session %q: %w", id, err)
+	resp := client.Do(ctx, client.B().Eval().Script(luaSessionCreate).
+		Numkeys(3).
+		Key(c.sessionKey(id), c.sessionBindKey(id), c.sessionUserKey(so.userID)).
+		Arg(string(b)).
+		Arg(strconv.FormatInt(ttl.Milliseconds(), 10)).
+		Arg(id).
+		Arg(so.userID).
+		Build())
+	if err := resp.Error(); err != nil {
+		return fmt.Errorf("cf_valkey_state: set session: %w", err)
 	}
 	c.sessionsCreated.Add(1)
 	return nil
@@ -564,12 +675,12 @@ func (c *CFState) CreateSession(ctx context.Context, id string, v any, ttl time.
 // found is false when the session does not exist or has expired. The session
 // TTL is not extended here; call TouchSession for a sliding window.
 func (c *CFState) GetSession(ctx context.Context, id string, dst any) (found bool, err error) {
+	if id == "" {
+		return false, errors.New("cf_valkey_state: GetSession: empty session id")
+	}
 	client, err := c.client()
 	if err != nil {
 		return false, err
-	}
-	if id == "" {
-		return false, errors.New("cf_valkey_state: GetSession: empty session id")
 	}
 	resp := client.Do(ctx, client.B().Get().Key(c.sessionKey(id)).Build())
 	if resp.Error() != nil {
@@ -583,19 +694,19 @@ func (c *CFState) GetSession(ctx context.Context, id string, dst any) (found boo
 		return false, err
 	}
 	if err := json.Unmarshal(b, dst); err != nil {
-		return false, fmt.Errorf("cf_valkey_state: unmarshal session %q: %w", id, err)
+		return false, fmt.Errorf("cf_valkey_state: unmarshal session: %w", err)
 	}
 	return true, nil
 }
 
 // SessionExists reports whether session:<id> exists and is unexpired.
 func (c *CFState) SessionExists(ctx context.Context, id string) (bool, error) {
+	if id == "" {
+		return false, errors.New("cf_valkey_state: SessionExists: empty session id")
+	}
 	client, err := c.client()
 	if err != nil {
 		return false, err
-	}
-	if id == "" {
-		return false, errors.New("cf_valkey_state: SessionExists: empty session id")
 	}
 	resp := client.Do(ctx, client.B().Exists().Key(c.sessionKey(id)).Build())
 	if resp.Error() != nil {
@@ -612,19 +723,24 @@ func (c *CFState) SessionExists(ctx context.Context, id string) (bool, error) {
 // missing or expired session is a no-op success. A ttl <= 0 uses the configured
 // default.
 func (c *CFState) TouchSession(ctx context.Context, id string, ttl time.Duration) error {
+	if id == "" {
+		return errors.New("cf_valkey_state: TouchSession: empty session id")
+	}
 	client, err := c.client()
 	if err != nil {
 		return err
 	}
-	if id == "" {
-		return errors.New("cf_valkey_state: TouchSession: empty session id")
-	}
 	if ttl <= 0 {
 		ttl = c.sessionTTLValue()
 	}
-	resp := client.Do(ctx, client.B().Pexpire().Key(c.sessionKey(id)).Milliseconds(ttl.Milliseconds()).Build())
+	resp := client.Do(ctx, client.B().Eval().Script(luaSessionTouch).
+		Numkeys(2).
+		Key(c.sessionKey(id), c.sessionBindKey(id)).
+		Arg(strconv.FormatInt(ttl.Milliseconds(), 10)).
+		Arg(c.sessionUserPrefix()).
+		Build())
 	if resp.Error() != nil {
-		return fmt.Errorf("cf_valkey_state: touch session %q: %w", id, resp.Error())
+		return fmt.Errorf("cf_valkey_state: touch session: %w", resp.Error())
 	}
 	n, err := resp.AsInt64()
 	if err != nil {
@@ -636,20 +752,101 @@ func (c *CFState) TouchSession(ctx context.Context, id string, ttl time.Duration
 	return nil
 }
 
-// RevokeSession deletes session:<id>. Deleting a missing session is a
+// RevokeSession deletes session:<id> and SREM from the user SET when the
+// session was created with WithSessionUser. Deleting a missing session is a
 // no-op success.
 func (c *CFState) RevokeSession(ctx context.Context, id string) error {
+	if id == "" {
+		return errors.New("cf_valkey_state: RevokeSession: empty session id")
+	}
 	client, err := c.client()
 	if err != nil {
 		return err
 	}
-	if id == "" {
-		return errors.New("cf_valkey_state: RevokeSession: empty session id")
-	}
-	if err := client.Do(ctx, client.B().Del().Key(c.sessionKey(id)).Build()).Error(); err != nil {
-		return fmt.Errorf("cf_valkey_state: revoke session %q: %w", id, err)
+	if err := client.Do(ctx, client.B().Eval().Script(luaSessionRevoke).
+		Numkeys(2).
+		Key(c.sessionKey(id), c.sessionBindKey(id)).
+		Arg(id).
+		Arg(c.sessionUserPrefix()).
+		Build()).Error(); err != nil {
+		return fmt.Errorf("cf_valkey_state: revoke session: %w", err)
 	}
 	c.sessionsRevoked.Add(1)
+	return nil
+}
+
+// ListSessionsForUser returns live session ids for userID (SMEMBERS on the
+// per-user SET, then EXISTS on each payload). Ghost members (expired payload)
+// are SREM'd. This is O(sessions of that user), not KEYS. Sessions created
+// without WithSessionUser are not listed. Empty userID is an error. Errors do
+// not include the user id.
+func (c *CFState) ListSessionsForUser(ctx context.Context, userID string) ([]string, error) {
+	if userID == "" {
+		return nil, errors.New("cf_valkey_state: ListSessionsForUser: empty user id")
+	}
+	client, err := c.client()
+	if err != nil {
+		return nil, err
+	}
+	resp := client.Do(ctx, client.B().Smembers().Key(c.sessionUserKey(userID)).Build())
+	if resp.Error() != nil {
+		return nil, fmt.Errorf("cf_valkey_state: list sessions: %w", resp.Error())
+	}
+	members, err := resp.AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("cf_valkey_state: list sessions: %w", err)
+	}
+	live := make([]string, 0, len(members))
+	for _, id := range members {
+		ex := client.Do(ctx, client.B().Exists().Key(c.sessionKey(id)).Build())
+		if ex.Error() != nil {
+			return nil, fmt.Errorf("cf_valkey_state: list sessions: %w", ex.Error())
+		}
+		n, err := ex.AsInt64()
+		if err != nil {
+			return nil, fmt.Errorf("cf_valkey_state: list sessions: %w", err)
+		}
+		if n == 1 {
+			live = append(live, id)
+			continue
+		}
+		_ = client.Do(ctx, client.B().Srem().Key(c.sessionUserKey(userID)).Member(id).Build())
+		_ = client.Do(ctx, client.B().Del().Key(c.sessionBindKey(id)).Build())
+	}
+	return live, nil
+}
+
+// RevokeAllForUser deletes every indexed session for userID except keep.
+// keep is typically the current session id ("revoke others"). Not KEYS.
+// Empty userID is an error. Errors do not include the user id.
+func (c *CFState) RevokeAllForUser(ctx context.Context, userID string, keep ...string) error {
+	if userID == "" {
+		return errors.New("cf_valkey_state: RevokeAllForUser: empty user id")
+	}
+	client, err := c.client()
+	if err != nil {
+		return err
+	}
+	args := []string{c.sessionPrefix(), c.sessionBindPrefix()}
+	args = append(args, keep...)
+	eval := client.B().Eval().Script(luaSessionRevokeAll).
+		Numkeys(1).
+		Key(c.sessionUserKey(userID)).
+		Arg(args[0])
+	for _, a := range args[1:] {
+		eval = eval.Arg(a)
+	}
+	resp := client.Do(ctx, eval.Build())
+	if err := resp.Error(); err != nil {
+		return fmt.Errorf("cf_valkey_state: revoke sessions: %w", err)
+	}
+	n, err := resp.AsInt64()
+	if err != nil {
+		return fmt.Errorf("cf_valkey_state: revoke sessions: %w", err)
+	}
+	if n > 0 {
+		c.sessionsRevoked.Add(uint64(n))
+	}
 	return nil
 }
 

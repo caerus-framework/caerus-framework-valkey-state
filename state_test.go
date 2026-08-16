@@ -221,6 +221,12 @@ func TestKeyHelpers(t *testing.T) {
 	if k := s.sessionKey("tok"); k != "session:tok" {
 		t.Fatalf("sessionKey = %q, want session:tok", k)
 	}
+	if k := s.sessionBindKey("tok"); k != "session-bind:tok" {
+		t.Fatalf("sessionBindKey = %q, want session-bind:tok", k)
+	}
+	if k := s.sessionUserKey("u1"); k != "session-user:u1" {
+		t.Fatalf("sessionUserKey = %q, want session-user:u1", k)
+	}
 	if k := s.cacheKey("users", "42"); k != "cache:users:42" {
 		t.Fatalf("cacheKey = %q, want cache:users:42", k)
 	}
@@ -246,5 +252,57 @@ func TestNewSourceEnvPrefix(t *testing.T) {
 	s2 := New(WithConfigSource("state", "", WithSourceEnvPrefix("")))
 	if s2.srcEnvPrefix != "" {
 		t.Fatalf("srcEnvPrefix = %q, want empty", s2.srcEnvPrefix)
+	}
+}
+
+func TestSessionErrorsOmitID(t *testing.T) {
+	s := New()
+	ctx := context.Background()
+	const id = "sess-secret-do-not-leak"
+
+	assertOmits := func(t *testing.T, op string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s: want error", op)
+		}
+		if strings.Contains(err.Error(), id) {
+			t.Fatalf("%s error includes session id: %v", op, err)
+		}
+	}
+
+	assertOmits(t, "CreateSession", s.CreateSession(ctx, id, testSession{UserID: "u"}, 0))
+	_, err := s.GetSession(ctx, id, &testSession{})
+	assertOmits(t, "GetSession", err)
+	_, err = s.SessionExists(ctx, id)
+	assertOmits(t, "SessionExists", err)
+	assertOmits(t, "TouchSession", s.TouchSession(ctx, id, 0))
+	assertOmits(t, "RevokeSession", s.RevokeSession(ctx, id))
+
+	empty := s.CreateSession(ctx, "", testSession{}, 0)
+	if empty == nil || !strings.Contains(empty.Error(), "empty session id") {
+		t.Fatalf("empty id = %v, want empty session id", empty)
+	}
+	if strings.Contains(empty.Error(), id) {
+		t.Fatalf("empty-id error includes token: %v", empty)
+	}
+
+	uid := "user-secret-do-not-leak"
+	if err := s.CreateSession(ctx, id, testSession{}, 0, WithSessionUser(uid)); err == nil {
+		t.Fatal("CreateSession before Init want error")
+	} else if strings.Contains(err.Error(), uid) || strings.Contains(err.Error(), id) {
+		t.Fatalf("indexed CreateSession error leaked id: %v", err)
+	}
+	if _, err := s.ListSessionsForUser(ctx, uid); err == nil {
+		t.Fatal("ListSessionsForUser before Init want error")
+	} else if strings.Contains(err.Error(), uid) {
+		t.Fatalf("list error leaked user id: %v", err)
+	}
+	if err := s.RevokeAllForUser(ctx, uid); err == nil {
+		t.Fatal("RevokeAllForUser before Init want error")
+	} else if strings.Contains(err.Error(), uid) {
+		t.Fatalf("revoke-all error leaked user id: %v", err)
+	}
+	if _, err := s.ListSessionsForUser(ctx, ""); err == nil || !strings.Contains(err.Error(), "empty user id") {
+		t.Fatalf("empty user list = %v", err)
 	}
 }
