@@ -552,7 +552,7 @@ func (c *CFState) applyConfigFromSource() error {
 	if !ok {
 		return fmt.Errorf("cf_valkey_state: configuration source %q not found", c.configSource)
 	}
-	c.applyConfig(*loaded)
+	c.applyConfig(loaded)
 	return nil
 }
 
