@@ -240,10 +240,28 @@ valkey) uses Path B Health, not this recipe.
 
 ## Configuration
 
-Load `StateConfig` through the configuration component. With the recommended
-source name `"valkey-state"`, the default `EnvPrefix` is `VALKEY_STATE_`;
-`env` tags map `VALKEY_STATE_SESSION_TTL_SEC`, `VALKEY_STATE_CACHE_TTL_SEC`
-(override with `WithSourceEnvPrefix` if you want a shorter prefix).
+Load `StateConfig` through the configuration component (`WithConfigSource`).
+With the recommended source name `"valkey-state"`, the default `EnvPrefix` is
+`VALKEY_STATE_` (override with `WithSourceEnvPrefix` on the source options).
+
+Configuration overlay order is **file → env → flags** (later wins). Two
+different shapes matter:
+
+| Field group | In JSON/YAML | Via env |
+|---|---|---|
+| Session / cache TTLs | Top-level `session_ttl_sec`, `cache_ttl_sec` | Yes — `VALKEY_STATE_SESSION_TTL_SEC`, `VALKEY_STATE_CACHE_TTL_SEC` |
+| Counter store (`rate_limit`) | Nested object (see below) | **No** direct nested walk — use flat `VALKEY_STATE_RATE_LIMIT_*` aliases |
+
+The configuration component walks **top-level** struct fields for env overlay.
+It does **not** recurse into nested structs. Session and cache TTLs are
+top-level on `StateConfig`, so env works normally. The counter store lives
+under nested `rate_limit` in the file; for env-only or PaaS overrides, this
+module declares **flat alias fields** on `StateConfig` that `applyConfig`
+merges into `rate_limit` (same pattern as postgres DSN overlays).
+
+### File example (Kubernetes / canonical)
+
+Use nested JSON or YAML when the file is the source of truth:
 
 ```json
 {
@@ -252,20 +270,58 @@ source name `"valkey-state"`, the default `EnvPrefix` is `VALKEY_STATE_`;
   "rate_limit": {
     "use_memory_fallback": true,
     "force_memory": false,
+    "memory_max_entries": 10000,
     "memory_map_full_policy": "deny"
   }
 }
 ```
 
-File/YAML may nest `rate_limit`. Env overlay does not recurse nested structs;
-use `VALKEY_STATE_RATE_LIMIT_USE_MEMORY_FALLBACK`, `_FORCE_MEMORY`,
-`_MEMORY_MAX_ENTRIES`, `_MEMORY_MAP_FULL_POLICY`. Do not flatten those
-switches onto the top of the JSON next to `session_ttl_sec` — the nested
-object is the counter store, not HTTP policy and not session TTLs.
+Do **not** flatten `use_memory_fallback` onto the top level next to
+`session_ttl_sec` — that object is the counter store only, not HTTP policy
+and not session TTLs.
 
-The tunables apply live: on reload `OnConfigReload` re-reads the source and
-replaces the TTL defaults (last-good on failure). The valkey peer owns
-connection rotation, so a reload never rebuilds anything here.
+### Env example (local / PaaS / fileless source)
+
+When you need env without a nested path, use the alias keys (prefix +
+`env` tag on `StateConfig`):
+
+```text
+VALKEY_STATE_SESSION_TTL_SEC=86400
+VALKEY_STATE_CACHE_TTL_SEC=300
+VALKEY_STATE_RATE_LIMIT_USE_MEMORY_FALLBACK=true
+VALKEY_STATE_RATE_LIMIT_FORCE_MEMORY=false
+VALKEY_STATE_RATE_LIMIT_MEMORY_MAX_ENTRIES=10000
+VALKEY_STATE_RATE_LIMIT_MEMORY_MAP_FULL_POLICY=deny
+```
+
+| Env key (default prefix) | Maps to |
+|---|---|
+| `VALKEY_STATE_SESSION_TTL_SEC` | `session_ttl_sec` |
+| `VALKEY_STATE_CACHE_TTL_SEC` | `cache_ttl_sec` |
+| `VALKEY_STATE_RATE_LIMIT_USE_MEMORY_FALLBACK` | `rate_limit.use_memory_fallback` |
+| `VALKEY_STATE_RATE_LIMIT_FORCE_MEMORY` | `rate_limit.force_memory` |
+| `VALKEY_STATE_RATE_LIMIT_MEMORY_MAX_ENTRIES` | `rate_limit.memory_max_entries` |
+| `VALKEY_STATE_RATE_LIMIT_MEMORY_MAP_FULL_POLICY` | `rate_limit.memory_map_full_policy` |
+
+Wrong vs right:
+
+```text
+Wrong: VALKEY_STATE_rate_limit.use_memory_fallback
+       → no dotted env paths; overlay does not walk into rate_limit
+
+Wrong: RATE_LIMIT_USE_MEMORY_FALLBACK
+       → wrong prefix; default source prefix is VALKEY_STATE_
+
+Right: VALKEY_STATE_RATE_LIMIT_USE_MEMORY_FALLBACK=true
+       → flat alias on StateConfig, merged in applyConfig
+
+Right: config/valkey-state.json with nested "rate_limit": { ... }
+       → file decode sets the nested struct directly
+```
+
+Reload: `OnConfigReload` re-reads the source and applies TTLs and counter
+settings (last-good on validation failure). The valkey peer owns connection
+rotation — a config reload here never rebuilds the Valkey client.
 
 `Metrics` emits the following while initialized, nil before Init/after
 Shutdown:

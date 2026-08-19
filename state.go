@@ -134,7 +134,9 @@ type StateConfig struct {
 	// at zero (default 5m).
 	CacheTTLSec int64 `json:"cache_ttl_sec,omitempty" yaml:"cache_ttl_sec,omitempty" env:"CACHE_TTL_SEC"`
 	// RateLimit is the nested counter-store section (Lua vs sticky-note map).
-	// HTTP limit/window numbers do not live here.
+	// HTTP limit/window numbers do not live here. Env overlay does not walk
+	// nested structs — use the flat RATE_LIMIT_* env tags on StateConfig
+	// (README → Configuration → Env example) or set rate_limit in the file.
 	RateLimit RateLimitConfig `json:"rate_limit,omitempty" yaml:"rate_limit,omitempty" env:"-"`
 
 	// Env overlay cannot recurse into nested structs; these aliases merge
