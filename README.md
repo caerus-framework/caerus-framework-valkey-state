@@ -132,6 +132,11 @@ token). Optional **user index** (no Redis `KEYS`):
 Empty session/user id is an error. Valkey/JSON errors **do not include**
 the session or user id — log those in the app if you need them.
 
+The JSON is **opaque**. This module does not interpret it. Do **not** put
+secrets in session JSON that a stolen Valkey dump (or replica) would leak
+(refresh tokens, password hashes, API keys). Apps own cookie flags and
+CSRF ([caerus-framework-http](https://github.com/caerus-framework/caerus-framework-http)).
+
 Do **not** use `Allow` / counters to list sessions. Do **not** `KEYS`.
 This module does not set cookies or CSRF tokens.
 
@@ -187,20 +192,86 @@ State **chooses** Lua vs the sticky-note map from nested file settings.
 The app does not pass “use memory on this call.” Only **counters** get a
 map — sessions and cache always need a live Valkey client.
 
+The in-process map is **not cluster-safe**. Two replicas do not share
+counts. Enabling fallback “so the limiter starts” and then scaling to
+three pods gives **three independent limits**, not one global limit.
+
+HTTP 429 / `KeyFunc` / FailOpen vs FailClosed live on
+[caerus-framework-http-ratelimiter](https://github.com/caerus-framework/caerus-framework-http-ratelimiter).
+That module decides what to do when **this** store errors. It does not
+make a per-pod map into a cluster counter.
+
+The two memory switches are **different**. Do not merge them.
+
 | Setting | Meaning |
 |---|---|
-| `force_memory` | Always use the map (GH App / laptop). |
-| `use_memory_fallback` | Lua first; on nil client or Eval error, use the map. |
+| `use_memory_fallback` | Valkey Lua **first**. Sticky-note map only if `Client()` is nil or Eval errors. |
+| `force_memory` | **Never** talk to Valkey for counters, even when ping works. Init logs `lame_memory_mode` if a client is live. |
 | `memory_map_full_policy` | `allow` or `deny` when the map hits its cap (required when memory is on). |
+
+```mermaid
+flowchart TD
+  a[Allow] --> b{force_memory?}
+  b -->|yes| m[Process-local map]
+  b -->|no| v{Valkey Client and Eval OK?}
+  v -->|yes| lua[Shared Lua counter]
+  v -->|no and use_memory_fallback| m
+  v -->|no and fallback off| err[Store error to HTTP limiter]
+```
+
+**Counter Path A (recommended for Kubernetes serve):** Valkey is up;
+**both** memory switches **off**. Shared Lua counters. Product Helm must
+not copy demo `force_memory` or `use_memory_fallback: true` into this
+chart.
+
+```json
+{
+  "rate_limit": {
+    "use_memory_fallback": false,
+    "force_memory": false
+  }
+}
+```
+
+**Counter Path B (break-glass / single replica / GH App):** memory on.
+Do **not** horizontally scale that Deployment if you still want a
+**global** limit, **or** accept that each pod has its own cap. Use
+`WithoutValkeyPeer` only when there is no fridge at all (sessions/cache
+will error).
+
+```json
+{
+  "rate_limit": {
+    "force_memory": true,
+    "memory_map_full_policy": "deny"
+  }
+}
+```
+
+`force_memory: true` in a multi-replica serve chart is a **policy
+footgun**: Valkey can be healthy and counters still ignore it. Keep it
+for Path B labs. `use_memory_fallback: true` on a scaled Deployment is
+the same split-brain once Valkey blips.
+
+```text
+Wrong: turn on use_memory_fallback so the limiter starts, then replica
+       the Deployment to 3 and expect one global login lockout.
+Right: Counter Path A — Valkey Lua, memory off. Path B — memory on and
+       one replica (or accept per-pod limits).
+
+Wrong: force_memory: true in prod because “the scream is only a log.”
+Right: Path B labs only. Live Valkey + force_memory is lame_memory_mode.
+```
 
 ### Health (`/readyz`)
 
-State does **not** PING. Valkey’s `Health` already PINGs. Two shapes:
+State does **not** PING. Valkey’s `Health` already PINGs. These **wiring**
+shapes are not Counter Path A/B (those are Lua vs map):
 
 | Wiring | After Init, `Health` |
 |---|---|
-| **Path A** — `WithoutValkeyPeer` + memory on (counters only) | **Ready.** No fridge. Sessions/cache still error. |
-| **Path B** — valkey declared (normal app) | **Ready only if `Client()` is non-nil.** Soft-init / DegradedMode can finish Init with a nil client; `/readyz` stays **red** until the peer connects. |
+| **Counters-only** — `WithoutValkeyPeer` + memory on | **Ready.** No fridge. Sessions/cache still error. |
+| **Valkey declared** — normal app | **Ready only if `Client()` is non-nil.** Soft-init / DegradedMode can finish Init with a nil client; `/readyz` stays **red** until the peer connects. |
 
 DegradedMode answers “may Initialize finish?” `/readyz` answers “send
 LB traffic?” Do not mix them.
@@ -220,7 +291,9 @@ cf_valkey_state.New(
 ```
 
 Init fails if memory is off. Mixed app (sessions + counters, **one**
-valkey) uses Path B Health, not this recipe.
+valkey) uses the **Valkey-declared** Health row above, not this recipe.
+That mixed app still wants **Counter Path A** (memory off) unless you
+deliberately accept Path B per-pod limits.
 
 ## Options
 
@@ -233,7 +306,7 @@ valkey) uses Path B Health, not this recipe.
 | `WithCacheTTL(d)` | default cache TTL when a call leaves ttl at zero (default `5m`) |
 | `WithValkeyName(name)` | bind to a named valkey peer (default `"valkey"`) |
 | `WithoutValkeyPeer()` | omit valkey (counter memory only; sessions/cache error) |
-| `WithUseMemoryFallback(bool)` / `WithForceMemory(bool)` | counter map (see `rate_limit`) |
+| `WithUseMemoryFallback(bool)` / `WithForceMemory(bool)` | counter map — two different switches; see Counter Path A/B under `rate_limit` |
 | `WithMemoryMapFullPolicy("allow"\|"deny")` | required when counter memory is on |
 | `WithName(name)` | custom component name for multiple instances (default `"valkey-state"`) |
 | `WithLogger(*slog.Logger)` | explicit logger override; defaults to the framework `logs` component's logger (re-delivered on `logs` `Reconfigure`), falling back to `slog.Default()` |
@@ -261,14 +334,15 @@ merges into `rate_limit` (same pattern as postgres DSN overlays).
 
 ### File example (Kubernetes / canonical)
 
-Use nested JSON or YAML when the file is the source of truth:
+Use nested JSON or YAML when the file is the source of truth.
+This example is **Counter Path A** (shared Lua; memory off):
 
 ```json
 {
   "session_ttl_sec": 86400,
   "cache_ttl_sec": 300,
   "rate_limit": {
-    "use_memory_fallback": true,
+    "use_memory_fallback": false,
     "force_memory": false,
     "memory_max_entries": 10000,
     "memory_map_full_policy": "deny"
@@ -288,7 +362,7 @@ When you need env without a nested path, use the alias keys (prefix +
 ```text
 VALKEY_STATE_SESSION_TTL_SEC=86400
 VALKEY_STATE_CACHE_TTL_SEC=300
-VALKEY_STATE_RATE_LIMIT_USE_MEMORY_FALLBACK=true
+VALKEY_STATE_RATE_LIMIT_USE_MEMORY_FALLBACK=false
 VALKEY_STATE_RATE_LIMIT_FORCE_MEMORY=false
 VALKEY_STATE_RATE_LIMIT_MEMORY_MAX_ENTRIES=10000
 VALKEY_STATE_RATE_LIMIT_MEMORY_MAP_FULL_POLICY=deny

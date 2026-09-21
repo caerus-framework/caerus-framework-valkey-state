@@ -149,8 +149,14 @@ type StateConfig struct {
 
 // RateLimitConfig is the counter store (not HTTP policy). Only this nested
 // block may use an in-process map — sessions and cache stay Valkey-only.
+// The two memory switches are different on purpose; do not merge them.
 type RateLimitConfig struct {
-	UseMemoryFallback   *bool  `json:"use_memory_fallback,omitempty" yaml:"use_memory_fallback,omitempty"`
+	// UseMemoryFallback: Valkey Lua first; sticky-note map if Client() is nil
+	// or Eval errors. Two replicas do not share the map (Counter Path B).
+	UseMemoryFallback *bool `json:"use_memory_fallback,omitempty" yaml:"use_memory_fallback,omitempty"`
+	// ForceMemory: never talk to Valkey for counters, even when ping works.
+	// Lab / GH App / Counter Path B only. Live client + this switch logs
+	// lame_memory_mode. Not the same as UseMemoryFallback.
 	ForceMemory         *bool  `json:"force_memory,omitempty" yaml:"force_memory,omitempty"`
 	MemoryMaxEntries    int    `json:"memory_max_entries,omitempty" yaml:"memory_max_entries,omitempty"`
 	MemoryMapFullPolicy string `json:"memory_map_full_policy,omitempty" yaml:"memory_map_full_policy,omitempty"`
@@ -262,20 +268,25 @@ func WithValkeyName(name string) Option {
 }
 
 // WithoutValkeyPeer omits valkey from GetDependencies (GH App / counters-only
-// sticky notes). Init then requires rate_limit memory (use_memory_fallback or
-// force_memory) plus memory_map_full_policy. Sessions and cache error: there
-// is no fridge.
+// sticky notes — Counter Path B). Init then requires rate_limit memory
+// (use_memory_fallback or force_memory) plus memory_map_full_policy. Sessions
+// and cache error: there is no fridge. Do not horizontally scale that
+// Deployment if you still want a global limit.
 func WithoutValkeyPeer() Option {
 	return func(o *options) { o.requireValkey = false }
 }
 
 // WithUseMemoryFallback enables the counter sticky-note map when Valkey
-// Eval fails or Client() is nil.
+// Eval fails or Client() is nil. Valkey is still tried first. This is not
+// force_memory. Production Counter Path A leaves it off.
 func WithUseMemoryFallback(enabled bool) Option {
 	return func(o *options) { o.useMemoryFallback = &enabled }
 }
 
-// WithForceMemory prefers the counter map even when a live Valkey client exists.
+// WithForceMemory never talks to Valkey for counters, even when a live
+// client exists. Lab / GH App / Counter Path B only — not a serve
+// Deployment that should share limits. Init logs lame_memory_mode when a
+// client is live. Do not merge this with use_memory_fallback.
 func WithForceMemory(enabled bool) Option {
 	return func(o *options) { o.forceMemory = &enabled }
 }
@@ -637,6 +648,8 @@ func WithSessionUser(userID string) SessionOption {
 // CreateSession stores a JSON session value at session:<id> with the given
 // TTL. A ttl <= 0 uses the configured default. The session id is chosen by the
 // caller (typically an opaque token); it is never derived from the value.
+// The payload is opaque: do not put secrets in it that a stolen Valkey dump
+// would leak. Cookie flags and CSRF live on caerus-framework-http, not here.
 // Pass WithSessionUser to maintain the per-user SET (Choice A). Without it,
 // the session exists by id only — ListSessionsForUser will not see it.
 func (c *CFState) CreateSession(ctx context.Context, id string, v any, ttl time.Duration, opts ...SessionOption) error {
